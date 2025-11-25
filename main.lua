@@ -748,7 +748,6 @@ end
 function Movement:digForward()
     return self.acid:run("dig_forward", { pos = deepcopy(self.pose:get()) }, function()
         clearBlock(turtle.detect, turtle.dig, turtle.attack)
-        turtle.digUp()
         return true
     end)
 end
@@ -758,6 +757,10 @@ function Movement:digDown()
         turtle.digDown()
         return true
     end)
+end
+
+function Movement:clearHeadroom()
+    return clearBlock(turtle.detectUp, turtle.digUp, turtle.attackUp)
 end
 
 ---------------------------------------------------------------------
@@ -1261,6 +1264,16 @@ end
 local TunnelPlanner = {}
 TunnelPlanner.__index = TunnelPlanner
 
+local function tunnelIsEarlier(a, b)
+    if a.origin.y ~= b.origin.y then
+        return (a.origin.y or 0) < (b.origin.y or 0)
+    end
+    if a.origin.x ~= b.origin.x then
+        return (a.origin.x or 0) < (b.origin.x or 0)
+    end
+    return (a.origin.z or 0) < (b.origin.z or 0)
+end
+
 function TunnelPlanner.new(config, store, logger)
     local planner = setmetatable({ config = config, store = store, logger = logger }, TunnelPlanner)
     planner:ensureTunnels()
@@ -1295,15 +1308,21 @@ function TunnelPlanner:list()
 end
 
 function TunnelPlanner:claimNext(turtleId)
-    for _, tunnel in pairs(self.store.data.tunnels) do
+    local bestId, bestTunnel
+    for id, tunnel in pairs(self.store.data.tunnels) do
         if tunnel.state == "idle" then
-            tunnel.state = "claimed"
-            tunnel.assignedTo = turtleId
-            self.store:save()
-            return deepcopy(tunnel)
+            if not bestTunnel or tunnelIsEarlier(tunnel, bestTunnel) then
+                bestId, bestTunnel = id, tunnel
+            end
         end
     end
-    return nil
+    if not bestTunnel then
+        return nil
+    end
+    bestTunnel.state = "claimed"
+    bestTunnel.assignedTo = turtleId
+    self.store:save()
+    return deepcopy(bestTunnel)
 end
 
 function TunnelPlanner:updateProgress(tunnelId, progress, state)
@@ -1548,6 +1567,7 @@ function Worker:runTunnelJob(job)
     if not ok then
         return false, true
     end
+    self.movement:clearHeadroom()
     self.scanner:scanNeighbors()
     tunnel.progress = tunnel.progress + 1
     self.store.data.metrics.mined = self.store.data.metrics.mined + 1
