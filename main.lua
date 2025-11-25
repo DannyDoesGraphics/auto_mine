@@ -306,13 +306,6 @@ local function interactiveConfig(quarryId)
     local chunkLength = promptNumber("Tunnel chunk length", DEFAULT_CONFIG.chunkLength, 4)
     local fuelReserve = promptNumber("Fuel reserve", DEFAULT_CONFIG.fuelReserve, 100)
     local targetFuel = promptNumber("Target fuel", DEFAULT_CONFIG.targetFuel, fuelReserve)
-    local facing = prompt("Spawn facing (north/south/east/west)", DEFAULT_CONFIG.spawnFacing, function(value)
-        local dir = CARDINAL_TO_DIR[value:lower()]
-        if not dir then
-            return false, "enter north/south/east/west"
-        end
-        return true, nil, value:lower()
-    end)
     local cfg = deepcopy(DEFAULT_CONFIG)
     cfg.boundingBox = { x = bbX, y = bbY, z = bbZ }
     cfg.tunnelSpacing = spacing
@@ -320,8 +313,8 @@ local function interactiveConfig(quarryId)
     cfg.chunkLength = chunkLength
     cfg.fuelReserve = fuelReserve
     cfg.targetFuel = targetFuel
-    cfg.spawnFacing = facing
-    cfg.spawnDir = CARDINAL_TO_DIR[facing]
+    cfg.spawnFacing = DEFAULT_CONFIG.spawnFacing
+    cfg.spawnDir = CARDINAL_TO_DIR[cfg.spawnFacing]
     cfg.quarryId = quarryId
     return cfg
 end
