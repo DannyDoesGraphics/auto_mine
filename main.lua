@@ -207,6 +207,7 @@ local DEFAULT_CONFIG = {
     restOffset = { x = -1, y = 0, z = -1 },
     jobRetryInterval = 5.0,
     maxJobFailures = 5,
+    statusLogInterval = 10.0,
     allowedFuel = {
         ["minecraft:coal"] = true,
         ["minecraft:charcoal"] = true,
@@ -617,8 +618,28 @@ end
 local Movement = {}
 Movement.__index = Movement
 
-function Movement.new(store, pose, acid, bbox, fuel)
-    return setmetatable({ store = store, pose = pose, acid = acid, bbox = bbox, fuel = fuel }, Movement)
+function Movement.new(store, pose, acid, bbox, fuel, logger)
+    return setmetatable({ store = store, pose = pose, acid = acid, bbox = bbox, fuel = fuel, logger = logger }, Movement)
+end
+
+function Movement:_blockPos(offset)
+    local pose = self.pose:get()
+    return {
+        x = pose.x + (offset.x or 0),
+        y = pose.y + (offset.y or 0),
+        z = pose.z + (offset.z or 0),
+    }
+end
+
+function Movement:_ensureBlockWithin(offset, action)
+    local blockPos = self:_blockPos(offset)
+    if self.bbox:contains(blockPos) then
+        return true, blockPos
+    end
+    if self.logger then
+        self.logger:write("WARN", string.format("Refusing %s outside bounds at %s", action, formatPos(blockPos)))
+    end
+    return false, blockPos
 end
 
 function Movement:_poseMatches(target)
@@ -746,6 +767,12 @@ function Movement:down()
 end
 
 function Movement:digForward()
+    local dirVec = deepcopy(self.pose:dirVector())
+    dirVec.y = 0
+    local allowed = self:_ensureBlockWithin(dirVec, "dig forward")
+    if not allowed then
+        return false, "out_of_bounds"
+    end
     return self.acid:run("dig_forward", { pos = deepcopy(self.pose:get()) }, function()
         clearBlock(turtle.detect, turtle.dig, turtle.attack)
         return true
@@ -753,6 +780,10 @@ function Movement:digForward()
 end
 
 function Movement:digDown()
+    local ok = self:_ensureBlockWithin({ x = 0, y = -1, z = 0 }, "dig down")
+    if not ok then
+        return false, "out_of_bounds"
+    end
     return self.acid:run("dig_down", {}, function()
         turtle.digDown()
         return true
@@ -760,6 +791,10 @@ function Movement:digDown()
 end
 
 function Movement:clearHeadroom()
+    local ok = self:_ensureBlockWithin({ x = 0, y = 1, z = 0 }, "clear headroom")
+    if not ok then
+        return false, "out_of_bounds"
+    end
     return clearBlock(turtle.detectUp, turtle.digUp, turtle.attackUp)
 end
 
@@ -1282,6 +1317,17 @@ end
 
 function TunnelPlanner:ensureTunnels()
     if self.store.data.tunnels and next(self.store.data.tunnels) then
+        local mutated = false
+        for _, tunnel in pairs(self.store.data.tunnels) do
+            if tunnel.origin and (tunnel.origin.z or 0) < 1 then
+                tunnel.origin.z = 1
+                mutated = true
+            end
+        end
+        if mutated then
+            self.logger:write("INFO", "Adjusted legacy tunnel origins to respect spawn boundary")
+            self.store:save()
+        end
         return
     end
     local tunnels = {}
@@ -1291,7 +1337,7 @@ function TunnelPlanner:ensureTunnels()
             local tunnelId = string.format("T%03d", id)
             tunnels[tunnelId] = {
                 id = tunnelId,
-                origin = { x = column, y = layer, z = 0 },
+                origin = { x = column, y = layer, z = 1 },
                 state = "idle",
                 progress = 0,
                 length = self.config.chunkLength,
@@ -1440,7 +1486,39 @@ function Worker.new(config, store, network, planner, pose, movement, navigator, 
         logger = logger,
         lastRequest = 0,
         failures = 0,
+        lastIdleLog = 0,
+        currentJobId = nil,
     }, Worker)
+end
+
+function Worker:_logIdle()
+    local interval = self.config.statusLogInterval or 10
+    if now() - self.lastIdleLog < interval then
+        return
+    end
+    self.lastIdleLog = now()
+    local pose = self.pose:get()
+    local pending = self.store.data.jobs.pending or {}
+    self.logger:write(
+        "INFO",
+        string.format(
+            "Idle at %s fuel=%d jobs=%d",
+            formatPos(pose),
+            self.fuel:level(),
+            #pending
+        )
+    )
+end
+
+function Worker:_logJobStart(job)
+    if self.currentJobId == job.id then
+        return
+    end
+    self.currentJobId = job.id
+    self.logger:write(
+        "INFO",
+        string.format("Starting job %s (%s) fuel=%d", job.id, job.type, self.fuel:level())
+    )
 end
 
 function Worker:activeJob()
@@ -1527,22 +1605,13 @@ function Worker:gotoPosition(pos)
 end
 
 function Worker:runOreJob(job)
-    local root = job.payload.origin
-    local visited = {}
-    local stack = { deepcopy(root) }
-    while #stack > 0 do
-        local node = table.remove(stack)
-        local key = posKey(node)
-        if not visited[key] then
-            visited[key] = true
-            self:gotoPosition({ x = node.x, y = node.y, z = node.z })
-            self.pose:face("forward")
-            self.movement:digForward()
-            for _, dir in ipairs(floodDirs) do
-                stack[#stack + 1] = { x = node.x + dir.x, y = node.y + dir.y, z = node.z + dir.z }
-            end
-        end
+    local target = deepcopy(job.payload.origin)
+    local ok, err = self.navigator:goTo(target)
+    if not ok then
+        self.logger:write("WARN", "Failed to reach ore vein", formatPos(target), err or "unknown error")
+        return false, true
     end
+    self.scanner:scanNeighbors()
     self.oreRegistry:markComplete(job.payload.key)
     self.store.data.metrics.ore = (self.store.data.metrics.ore or 0) + 1
     self.store:save()
@@ -1562,7 +1631,11 @@ function Worker:runTunnelJob(job)
     self.navigator:goTo(target)
     self.pose:face("forward")
     self.scanner:inspectForward()
-    self.movement:digForward()
+    local dug, reason = self.movement:digForward()
+    if not dug then
+        self.logger:write("WARN", "Unable to clear tunnel block", reason or "unknown reason")
+        return false, reason ~= "out_of_bounds"
+    end
     local ok = self.movement:forward()
     if not ok then
         return false, true
@@ -1607,8 +1680,10 @@ function Worker:tick()
     self:ensureTunnelJob()
     local job = self.jobs:popNext()
     if not job then
+        self:_logIdle()
         return { state = "idle", job = nil, fuel = self.fuel:level() }
     end
+    self:_logJobStart(job)
     local done, retry = self:stepJob(job)
     if done then
         self.logger:write("INFO", "Completed job", job.id, job.type)
@@ -1692,7 +1767,7 @@ local function main(...)
     local pose = Pose.wrap(store.data)
     pose:setDir(config.spawnDir or pose:get().dir)
     local acid = Acid.new(config, store)
-    local movement = Movement.new(store, pose, acid, bbox, fuel)
+    local movement = Movement.new(store, pose, acid, bbox, fuel, logger)
     movement:attachVerifiers()
     acid:register("dig_forward", function()
         return not turtle.detect()
