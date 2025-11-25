@@ -103,6 +103,12 @@ function Logger:write(level, ...)
 	end)
 end
 
+local function debugLog(config, logger, ...)
+	if config and config.debug then
+		logger:write("DEBUG", ...)
+	end
+end
+
 ---------------------------------------------------------------------
 -- Configuration management
 ---------------------------------------------------------------------
@@ -126,6 +132,7 @@ local DEFAULT_CONFIG = {
 	depositOffset = { x = 0, y = 0, z = -1 },
 	jobRetryInterval = 5.0,
 	maxJobFailures = 5,
+	debug = true,
 	allowedFuel = {
 		["minecraft:coal"] = true,
 		["minecraft:charcoal"] = true,
@@ -789,6 +796,7 @@ function Leader:updateMaster()
 		candidates[#candidates + 1] = self.network.id
 	end
 	table.sort(candidates)
+	debugLog(self.config, self.logger, "Leader candidates", textutils.serialize(candidates))
 	local masterId = candidates[1]
 	if masterId ~= self.store.data.masterId then
 		self.logger:write("INFO", "New master elected", masterId)
@@ -811,6 +819,7 @@ function Leader:tick(jobStatus)
 	local timeSince = now() - self.lastHeartbeat
 	if timeSince >= self.config.heartbeatInterval then
 		self.lastHeartbeat = now()
+		debugLog(self.config, self.logger, "Sending heartbeat", textutils.serialize(jobStatus))
 		self.network:send({ type = "heartbeat", status = jobStatus.state, job = jobStatus.job, fuel = jobStatus.fuel })
 	end
 end
@@ -913,6 +922,7 @@ end
 
 function Worker:requestJob()
 	if now() - self.lastRequest < self.config.jobRetryInterval then
+		debugLog(self.config, self.logger, "Skipping job request due to throttle")
 		return
 	end
 	self.lastRequest = now()
@@ -921,13 +931,17 @@ function Worker:requestJob()
 		if job then
 			self.logger:write("INFO", "Self-assigned tunnel", job.id)
 			self:setJob(job)
+		else
+			debugLog(self.config, self.logger, "No idle tunnels available for self assignment")
 		end
 	else
+		debugLog(self.config, self.logger, "Requesting job from master", self.store.data.masterId)
 		self.network:send({ type = "job_request" }, self.store.data.masterId)
 	end
 end
 
 function Worker:handleMessage(msg)
+	debugLog(self.config, self.logger, "Handling message", msg.type, msg.sender or "?", msg.target or "-")
 	if msg.type == "assign" and msg.target == self.network.id then
 		self.logger:write("INFO", "Received assignment", msg.job.id)
 		self:setJob(msg.job)
@@ -947,10 +961,12 @@ function Worker:ensureAtWorkface(job)
 		y = job.origin.y,
 		z = job.origin.z + job.progress,
 	}
+	debugLog(self.config, self.logger, string.format("Navigating to workface %s -> (%d,%d,%d)", job.id, target.x, target.y, target.z))
 	return self.navigator:goTo(target)
 end
 
 function Worker:stepJob(job)
+	debugLog(self.config, self.logger, string.format("Stepping job %s progress %d/%d", job.id, job.progress, job.length))
 	self:ensureAtWorkface(job)
 	self.navigator:faceForward()
 	self.movement:digForward()
@@ -960,6 +976,7 @@ function Worker:stepJob(job)
 	end
 	self.movement:digForward()
 	job.progress = job.progress + 1
+	debugLog(self.config, self.logger, string.format("Job %s advanced to %d", job.id, job.progress))
 	self.planner:updateProgress(job.id, job.progress, "active")
 	self.store:save()
 	self.store.data.metrics.mined = self.store.data.metrics.mined + 1
@@ -979,10 +996,12 @@ end
 function Worker:tick()
 	local job = self:activeJob()
 	if not job then
+		debugLog(self.config, self.logger, "Idle worker requesting job")
 		self:requestJob()
 		return { state = "idle", job = nil, fuel = self.fuel:level() }
 	end
 	if self.inventory:isFull() or self.inventory:stackSpace() < 4 then
+		debugLog(self.config, self.logger, "Inventory saturated; depositing")
 		self.inventory:depositAll()
 	end
 	if not self.fuel:ensure(self.config.fuelReserve) then
@@ -997,12 +1016,14 @@ function Worker:tick()
 		self.failures = self.failures + 1
 		self.logger:write("ERROR", "Failed job step", err)
 		if self.failures >= self.config.maxJobFailures then
+			debugLog(self.config, self.logger, "Abandoning job after repeated failures", job.id)
 			self:setJob(nil)
 		end
 	else
 		self.failures = 0
 		if job.state == "done" then
 			self:completeJob(job)
+			debugLog(self.config, self.logger, "Job marked complete", job.id)
 			self.inventory:returnToStack()
 		else
 			self:setJob(job)
@@ -1029,6 +1050,17 @@ local function messageLoop(network, leader, worker, logger)
 		local status = worker:tick()
 		leader:tick(status)
 		leader:updateMaster()
+		local poseState = worker.pose:get()
+		debugLog(worker.config, logger, string.format(
+			"Loop status master=%s job=%s state=%s fuel=%s pose=(%d,%d,%d)",
+			tostring(worker.store.data.masterId),
+			status.job or "none",
+			status.state,
+			tostring(status.fuel),
+			poseState.x,
+			poseState.y,
+			poseState.z
+		))
 		sleepFn(0)
 	end
 end
