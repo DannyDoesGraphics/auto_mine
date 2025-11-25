@@ -11,6 +11,7 @@ local DOCS = {
     textutils = "cc_docs/tweaked.cc/module/textutils.html",
     fs = "cc_docs/tweaked.cc/module/fs.html",
     peripheral = "cc_docs/tweaked.cc/module/peripheral.html",
+    bit32 = "cc_docs/tweaked.cc/module/bit32.html",
 }
 
 local function verifyApi(name, docPath)
@@ -24,12 +25,14 @@ verifyApi("textutils", DOCS.textutils)
 verifyApi("rednet", DOCS.rednet)
 verifyApi("fs", DOCS.fs)
 verifyApi("peripheral", DOCS.peripheral)
+verifyApi("bit32", DOCS.bit32)
 
 local turtle = _G.turtle
 local textutils = _G.textutils
 local rednet = _G.rednet
 local fs = _G.fs
 local peripheral = _G.peripheral
+local bit32 = _G.bit32
 local term = _G.term
 local read = _G.read
 local sleep = _G.sleep
@@ -149,7 +152,7 @@ local function simpleHash(str)
     -- FNV-1a 32-bit for deterministic checksums
     local hash = 2166136261
     for i = 1, #str do
-        hash = hash ~ string.byte(str, i)
+        hash = bit32.bxor(hash, string.byte(str, i)) -- DOCS.bit32
         hash = (hash * 16777619) % 4294967296
     end
     return hash
