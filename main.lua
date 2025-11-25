@@ -63,6 +63,20 @@ local function deepMerge(base, overrides)
     return out
 end
 
+local function mergeDefaults(target, defaults)
+    for k, v in pairs(defaults) do
+        if target[k] == nil then
+            if type(v) == "table" then
+                target[k] = shallowCopy(v)
+            else
+                target[k] = v
+            end
+        elseif type(v) == "table" and type(target[k]) == "table" then
+            mergeDefaults(target[k], v)
+        end
+    end
+end
+
 local function ensureDir(path)
     if fs.exists(path) and not fs.isDir(path) then
         error(("Expected directory at %s but found file."):format(path))
@@ -143,6 +157,91 @@ end
 
 local function serializeForHash(tbl)
     return textutils.serialise(tbl, { compact = true })
+end
+
+local function clonePosition(pos)
+    if not pos then
+        return { x = 0, y = 0, z = 0 }
+    end
+    return { x = pos.x, y = pos.y, z = pos.z }
+end
+
+local function sign(num)
+    if num > 0 then
+        return 1
+    elseif num < 0 then
+        return -1
+    end
+    return 0
+end
+
+local Orientation = {}
+
+Orientation.VECTORS = {
+    [0] = { x = 1, z = 0 },
+    [1] = { x = 0, z = 1 },
+    [2] = { x = -1, z = 0 },
+    [3] = { x = 0, z = -1 },
+}
+
+function Orientation.normalize(facing)
+    local normalized = facing % 4
+    if normalized < 0 then
+        normalized = normalized + 4
+    end
+    return normalized
+end
+
+function Orientation.vector(facing)
+    return Orientation.VECTORS[Orientation.normalize(facing)]
+end
+
+function Orientation.left(facing)
+    return Orientation.normalize(facing - 1)
+end
+
+function Orientation.right(facing)
+    return Orientation.normalize(facing + 1)
+end
+
+function Orientation.opposite(facing)
+    return Orientation.normalize(facing + 2)
+end
+
+function Orientation.facingForVector(vec)
+    local normalized = { x = sign(vec.x), z = sign(vec.z) }
+    for facing, v in pairs(Orientation.VECTORS) do
+        if v.x == normalized.x and v.z == normalized.z then
+            return facing
+        end
+    end
+    return nil
+end
+
+function Orientation.vectorForRelative(facing, direction)
+    if direction == "forward" then
+        local vec = Orientation.vector(facing)
+        return { x = vec.x, y = 0, z = vec.z }
+    elseif direction == "back" then
+        local vec = Orientation.vector(Orientation.opposite(facing))
+        return { x = vec.x, y = 0, z = vec.z }
+    elseif direction == "left" then
+        local vec = Orientation.vector(Orientation.left(facing))
+        return { x = vec.x, y = 0, z = vec.z }
+    elseif direction == "right" then
+        local vec = Orientation.vector(Orientation.right(facing))
+        return { x = vec.x, y = 0, z = vec.z }
+    elseif direction == "up" then
+        return { x = 0, y = 1, z = 0 }
+    elseif direction == "down" then
+        return { x = 0, y = -1, z = 0 }
+    end
+    error("Unknown relative direction: " .. tostring(direction))
+end
+
+function Orientation.describe(facing)
+    local names = { "+X", "+Z", "-X", "-Z" }
+    return names[Orientation.normalize(facing) + 1]
 end
 
 local Log = {
@@ -248,6 +347,7 @@ local DEFAULT_CONFIG = {
     },
     job = {
         retryLimit = 5,
+        maxOreNodes = 96,
     },
 }
 
@@ -328,6 +428,7 @@ local function createConfigInteractively(quarryId)
     cfg.logging.consoleVerbosity = prompt("Console verbosity (trace/debug/info/warn/error)", cfg.logging.consoleVerbosity)
     cfg.fuel.reserve = promptNumber("Fuel reserve threshold", cfg.fuel.reserve)
     cfg.job.retryLimit = promptNumber("Job retry limit", cfg.job.retryLimit)
+    cfg.job.maxOreNodes = promptNumber("Max ore nodes per job", cfg.job.maxOreNodes)
     cfg.version = (cfg.version or 0) + 1
     writeJson(configPath(quarryId), cfg)
     return cfg
@@ -339,6 +440,7 @@ local function loadOrInitConfig(quarryId)
         return createConfigInteractively(quarryId)
     end
     local cfg = readJson(path, DEFAULT_CONFIG)
+    cfg = deepMerge(DEFAULT_CONFIG, cfg)
     cfg.version = (cfg.version or 0) + 1
     writeJson(path, cfg)
     return cfg
@@ -356,15 +458,19 @@ local function defaultTurtleState(quarryId, turtleId)
         lastConfigVersion = 0,
         jobCursor = nil,
         fuelLog = {},
+        oreBookmarks = {},
     }
 end
 
 function TurtleState.load(quarryId, turtleId)
     local path = turtleStatePath(quarryId, turtleId)
+    local defaults = defaultTurtleState(quarryId, turtleId)
     if not fs.exists(path) then
-        return defaultTurtleState(quarryId, turtleId)
+        return defaults
     end
-    return readJson(path, defaultTurtleState(quarryId, turtleId))
+    local state = readJson(path, defaults)
+    mergeDefaults(state, defaults)
+    return state
 end
 
 function TurtleState.save(state)
@@ -403,8 +509,14 @@ local function calibrateVertical(state, cfg)
             break
         end
     end
+    state.position.x = cfg.spawn.column.x
+    state.position.z = cfg.spawn.column.z
     state.position.y = 0
     state.calibrated = true
+    local facing = Orientation.facingForVector(cfg.boundingBox.originForward or { x = 0, z = 1 })
+    if facing then
+        state.facing = facing
+    end
     Log.write("info", "Vertical calibration complete", { down = movedDown, up = movedUp })
 end
 
@@ -538,6 +650,7 @@ function Jobs.enqueue(quarryId, job)
         priority = job.priority or 3,
         createdAt = os.epoch("utc"),
         status = "queued",
+        attempts = 0,
     }
     appendJobRecord(quarryId, record)
     Log.write("info", "Enqueued job", { id = record.id, type = job.type })
@@ -545,42 +658,106 @@ function Jobs.enqueue(quarryId, job)
 end
 
 function Jobs.loadQueue(quarryId)
-    local records = readJobRecords(quarryId)
-    table.sort(records, function(a, b)
+    local history = readJobRecords(quarryId)
+    local latest = {}
+    for _, record in ipairs(history) do
+        latest[record.id] = record
+    end
+    local queued = {}
+    for _, record in pairs(latest) do
+        if record.status == "queued" or record.status == "claimed" then
+            queued[#queued + 1] = record
+        end
+    end
+    table.sort(queued, function(a, b)
         if a.priority == b.priority then
             return a.createdAt < b.createdAt
         end
         return a.priority < b.priority
     end)
-    return records
+    return queued
 end
 
 local Scheduler = {}
+local JobExecutors = {}
+
+function Scheduler.register(jobType, handler)
+    JobExecutors[jobType] = handler
+end
+
+function Scheduler.execute(quarryId, record, state, cfg)
+    local handler = JobExecutors[record.job.type]
+    if not handler then
+        return false, { success = false, error = "unknown job type" }
+    end
+    local ctx = {
+        quarryId = quarryId,
+        state = state,
+        cfg = cfg,
+        job = record.job,
+        record = record,
+        enqueue = function(job)
+            return Jobs.enqueue(quarryId, job)
+        end,
+    }
+    local ok, result = pcall(handler, ctx)
+    if not ok then
+        Log.write("error", "Job handler crashed", { id = record.id, err = tostring(result) })
+        return false, { success = false, error = tostring(result) }
+    end
+    if result == nil then
+        result = { success = true }
+    end
+    if result.success == nil then
+        result.success = true
+    end
+    return result.success, result
+end
 
 function Scheduler.nextJob(records, state)
     for _, record in ipairs(records) do
-        if not record.claimedBy or record.claimedBy == state.turtleId then
+        if (record.status == "queued" and not record.claimedBy)
+            or (record.status == "claimed" and record.claimedBy == state.turtleId) then
             return record
         end
     end
     return nil
 end
 
-function Scheduler.claimJob(record, state)
+function Scheduler.claimJob(quarryId, record, state)
     record.claimedBy = state.turtleId
     record.claimedAt = os.epoch("utc")
     record.status = "claimed"
-    appendJobRecord(state.quarryId, record)
+    appendJobRecord(quarryId, record)
 end
 
-function Scheduler.completeJob(record, outcome)
+function Scheduler.completeJob(quarryId, record, outcome)
     record.status = outcome.success and "completed" or "failed"
     record.result = outcome
-    appendJobRecord(outcome.quarryId, record)
+    appendJobRecord(quarryId, record)
     Network.broadcast("job_status", {
         id = record.id,
         status = record.status,
     })
+end
+
+function Scheduler.failJob(quarryId, record, reason, cfg)
+    record.attempts = (record.attempts or 0) + 1
+    record.lastError = reason
+    if record.attempts >= (cfg.job.retryLimit or DEFAULT_CONFIG.job.retryLimit) then
+        record.status = "failed"
+        appendJobRecord(quarryId, record)
+        Network.broadcast("job_status", {
+            id = record.id,
+            status = record.status,
+            error = reason,
+        })
+        return
+    end
+    record.status = "queued"
+    record.claimedBy = nil
+    record.claimedAt = nil
+    appendJobRecord(quarryId, record)
 end
 
 local function withinBoundingBox(pos, cfg)
@@ -597,59 +774,610 @@ end
 
 local Movement = {}
 
-function Movement.forward(state, cfg)
-    if not withinBoundingBox({ x = state.position.x + 1, y = state.position.y, z = state.position.z }, cfg) then
-        Log.write("warn", "Blocked move outside bounding box", { axis = "x" })
-        return false
+local CLEAR_OPS = {
+    forward = { detect = turtle.detect, dig = turtle.dig },
+    up = { detect = turtle.detectUp, dig = turtle.digUp },
+    down = { detect = turtle.detectDown, dig = turtle.digDown },
+}
+
+local INSPECT_OPS = {
+    forward = turtle.inspect,
+    up = turtle.inspectUp,
+    down = turtle.inspectDown,
+}
+
+local function clearDirection(direction)
+    local ops = CLEAR_OPS[direction]
+    if not ops then
+        return
     end
-    while turtle.detect() do
-        turtle.dig() -- per DOCS.turtle dig() supports clearing blocks before movement
+    while ops.detect() do
+        ops.dig() -- DOCS.turtle: dig/digUp/digDown clear blocks before motion
         sleep(0.2)
     end
-    local ok, reason = turtle.forward()
+end
+
+local function applyDelta(pos, delta)
+    return {
+        x = pos.x + (delta.x or 0),
+        y = pos.y + (delta.y or 0),
+        z = pos.z + (delta.z or 0),
+    }
+end
+
+local function commitPosition(state, newPos)
+    state.position.x = newPos.x
+    state.position.y = newPos.y
+    state.position.z = newPos.z
+end
+
+function Movement.turnLeft(state)
+    local ok, err = turtle.turnLeft() -- DOCS.turtle turnLeft rotates 90°
     if not ok then
-        Log.write("warn", "turtle.forward failed", { reason = tostring(reason) })
+        Log.write("warn", "turnLeft failed", { err = tostring(err) })
         return false
     end
-    state.position.x = state.position.x + 1
+    state.facing = Orientation.left(state.facing)
+    return true
+end
+
+function Movement.turnRight(state)
+    local ok, err = turtle.turnRight()
+    if not ok then
+        Log.write("warn", "turnRight failed", { err = tostring(err) })
+        return false
+    end
+    state.facing = Orientation.right(state.facing)
+    return true
+end
+
+function Movement.face(state, targetFacing)
+    targetFacing = Orientation.normalize(targetFacing)
+    while state.facing ~= targetFacing do
+        local clockwise = (targetFacing - state.facing) % 4
+        if clockwise == 3 then
+            if not Movement.turnLeft(state) then
+                return false
+            end
+        else
+            if not Movement.turnRight(state) then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+local function attemptMove(fn, direction)
+    local ok, reason = fn()
+    if not ok then
+        Log.write("warn", "turtle move failed", { direction = direction, reason = tostring(reason) })
+        return false
+    end
+    return true
+end
+
+function Movement.forward(state, cfg)
+    local delta = Orientation.vectorForRelative(state.facing, "forward")
+    local target = applyDelta(state.position, delta)
+    if not withinBoundingBox(target, cfg) then
+        Log.write("warn", "Blocked move outside bounding box", { axis = "forward" })
+        return false
+    end
+    clearDirection("forward")
+    if not attemptMove(turtle.forward, "forward") then
+        return false
+    end
+    commitPosition(state, target)
+    return true
+end
+
+function Movement.back(state, cfg)
+    local delta = Orientation.vectorForRelative(state.facing, "back")
+    local target = applyDelta(state.position, delta)
+    if not withinBoundingBox(target, cfg) then
+        Log.write("warn", "Blocked backward move outside box", {})
+        return false
+    end
+    if not attemptMove(turtle.back, "back") then -- DOCS.turtle back()
+        return false
+    end
+    commitPosition(state, target)
     return true
 end
 
 function Movement.up(state, cfg)
-    if not withinBoundingBox({ x = state.position.x, y = state.position.y + 1, z = state.position.z }, cfg) then
+    local delta = Orientation.vectorForRelative(state.facing, "up")
+    local target = applyDelta(state.position, delta)
+    if not withinBoundingBox(target, cfg) then
         Log.write("warn", "Blocked upward movement outside bounding box", {})
         return false
     end
-    while turtle.detectUp() do
-        turtle.digUp()
-        sleep(0.2)
-    end
-    local ok, reason = turtle.up()
-    if not ok then
-        Log.write("warn", "turtle.up failed", { reason = tostring(reason) })
+    clearDirection("up")
+    if not attemptMove(turtle.up, "up") then
         return false
     end
-    state.position.y = state.position.y + 1
+    commitPosition(state, target)
     return true
 end
 
 function Movement.down(state, cfg)
-    if not withinBoundingBox({ x = state.position.x, y = state.position.y - 1, z = state.position.z }, cfg) then
+    local delta = Orientation.vectorForRelative(state.facing, "down")
+    local target = applyDelta(state.position, delta)
+    if not withinBoundingBox(target, cfg) then
         Log.write("warn", "Blocked downward movement outside bounding box", {})
         return false
     end
-    while turtle.detectDown() do
-        turtle.digDown()
-        sleep(0.2)
-    end
-    local ok, reason = turtle.down()
-    if not ok then
-        Log.write("warn", "turtle.down failed", { reason = tostring(reason) })
+    clearDirection("down")
+    if not attemptMove(turtle.down, "down") then
         return false
     end
-    state.position.y = state.position.y - 1
+    commitPosition(state, target)
     return true
 end
+
+function Movement.step(state, cfg, direction)
+    if direction == "forward" then
+        return Movement.forward(state, cfg)
+    elseif direction == "back" then
+        return Movement.back(state, cfg)
+    elseif direction == "up" then
+        return Movement.up(state, cfg)
+    elseif direction == "down" then
+        return Movement.down(state, cfg)
+    elseif direction == "left" then
+        if not Movement.turnLeft(state) then
+            return false
+        end
+        local ok = Movement.forward(state, cfg)
+        Movement.turnRight(state)
+        return ok
+    elseif direction == "right" then
+        if not Movement.turnRight(state) then
+            return false
+        end
+        local ok = Movement.forward(state, cfg)
+        Movement.turnLeft(state)
+        return ok
+    end
+    error("Unsupported move direction: " .. tostring(direction))
+end
+
+function Movement.inspect(state, direction)
+    local inspector = INSPECT_OPS[direction]
+    if inspector then
+        return inspector()
+    end
+    if direction == "left" then
+        if not Movement.turnLeft(state) then
+            return false, nil
+        end
+        local ok, data = turtle.inspect()
+        Movement.turnRight(state)
+        return ok, data
+    elseif direction == "right" then
+        if not Movement.turnRight(state) then
+            return false, nil
+        end
+        local ok, data = turtle.inspect()
+        Movement.turnLeft(state)
+        return ok, data
+    elseif direction == "back" then
+        if not Movement.turnRight(state) then
+            return false, nil
+        end
+        if not Movement.turnRight(state) then
+            Movement.turnLeft(state) -- attempt to restore orientation if second turn fails
+            return false, nil
+        end
+        local ok, data = turtle.inspect()
+        Movement.turnRight(state)
+        Movement.turnRight(state)
+        return ok, data
+    end
+    error("Unsupported inspect direction: " .. tostring(direction))
+end
+
+function Movement.faceVector(state, vec)
+    local facing = Orientation.facingForVector(vec)
+    if facing == nil then
+        return false, "vector not cardinal"
+    end
+    return Movement.face(state, facing), nil
+end
+
+function Movement.clear(direction)
+    clearDirection(direction)
+end
+
+function Movement.project(state, direction)
+    local delta = Orientation.vectorForRelative(state.facing, direction)
+    return applyDelta(state.position, delta)
+end
+
+function Movement.clearRelative(state, direction)
+    if direction == "forward" or direction == "up" or direction == "down" then
+        clearDirection(direction)
+        return true
+    elseif direction == "left" then
+        if not Movement.turnLeft(state) then
+            return false
+        end
+        clearDirection("forward")
+        Movement.turnRight(state)
+        return true
+    elseif direction == "right" then
+        if not Movement.turnRight(state) then
+            return false
+        end
+        clearDirection("forward")
+        Movement.turnLeft(state)
+        return true
+    elseif direction == "back" then
+        if not Movement.turnRight(state) then
+            return false
+        end
+        if not Movement.turnRight(state) then
+            Movement.turnLeft(state)
+            return false
+        end
+        clearDirection("forward")
+        Movement.turnRight(state)
+        Movement.turnRight(state)
+        return true
+    end
+    error("Unsupported clear direction: " .. tostring(direction))
+end
+
+local Navigator = {}
+
+local function moveAxis(state, cfg, axis, target)
+    local delta = target - state.position[axis]
+    if delta == 0 then
+        return true
+    end
+    local step = delta > 0 and 1 or -1
+    local facing
+    if axis == "x" then
+        facing = (step > 0) and 0 or 2
+    elseif axis == "z" then
+        facing = (step > 0) and 1 or 3
+    else
+        error("Unsupported axis: " .. tostring(axis))
+    end
+    if not Movement.face(state, facing) then
+        return false
+    end
+    while state.position[axis] ~= target do
+        if not Movement.forward(state, cfg) then
+            return false
+        end
+    end
+    return true
+end
+
+local function moveVertical(state, cfg, targetY)
+    while state.position.y < targetY do
+        if not Movement.up(state, cfg) then
+            return false
+        end
+    end
+    while state.position.y > targetY do
+        if not Movement.down(state, cfg) then
+            return false
+        end
+    end
+    return true
+end
+
+function Navigator.moveTo(state, cfg, target)
+    if not moveVertical(state, cfg, target.y or state.position.y) then
+        return false
+    end
+    if not moveAxis(state, cfg, "x", target.x or state.position.x) then
+        return false
+    end
+    if not moveAxis(state, cfg, "z", target.z or state.position.z) then
+        return false
+    end
+    return true
+end
+
+function Navigator.returnToSpawn(state, cfg)
+    local target = {
+        x = cfg.spawn.column.x,
+        y = cfg.spawn.topY,
+        z = cfg.spawn.column.z,
+    }
+    return Navigator.moveTo(state, cfg, target)
+end
+
+function Navigator.faceInventories(state, cfg)
+    local facing = Orientation.facingForVector(cfg.boundingBox.originForward or { x = 0, z = 1 }) or 1
+    local inventoryFacing = Orientation.opposite(facing)
+    return Movement.face(state, inventoryFacing)
+end
+
+local function isOreBlock(block)
+    if not block or not block.name then
+        return false
+    end
+    if block.tags then
+        for tag, present in pairs(block.tags) do
+            if present and tag:find("ore") then
+                return true
+            end
+        end
+    end
+    return block.name:find("ore") ~= nil
+end
+
+local function oreKey(pos, blockName)
+    return ("%d:%d:%d:%s"):format(pos.x, pos.y, pos.z, blockName or "?")
+end
+
+local function queueOreJob(ctx, orePos, blockName, direction)
+    local key = oreKey(orePos, blockName)
+    ctx.state.oreBookmarks = ctx.state.oreBookmarks or {}
+    if ctx.state.oreBookmarks[key] then
+        return
+    end
+    local jobDetails = {
+        target = clonePosition(orePos),
+        block = blockName,
+        approach = clonePosition(ctx.state.position),
+        approachFacing = ctx.state.facing,
+        entryDirection = direction,
+        oreKey = key,
+        maxNodes = ctx.cfg.job and ctx.cfg.job.maxOreNodes or 128,
+    }
+    local record = ctx.enqueue({
+        type = "ore",
+        priority = 2,
+        details = jobDetails,
+    })
+    ctx.state.oreBookmarks[key] = record.id
+    TurtleState.save(ctx.state)
+    Log.write("info", "Queued ore job", {
+        job = record.id,
+        pos = key,
+        block = blockName,
+    })
+end
+
+local ORE_SCAN_DIRECTIONS = { "left", "right", "up", "down" }
+
+local function scanForSideOres(ctx)
+    for _, direction in ipairs(ORE_SCAN_DIRECTIONS) do
+        local ok, block = Movement.inspect(ctx.state, direction)
+        if ok and block and isOreBlock(block) then
+            local orePos = Movement.project(ctx.state, direction)
+            if withinBoundingBox(orePos, ctx.cfg) then
+                queueOreJob(ctx, orePos, block.name, direction)
+            else
+                Log.write("debug", "Ore detected outside bounding box, skipping", {
+                    dir = direction,
+                    block = block.name,
+                })
+            end
+        end
+    end
+end
+
+local FLOOD_DIRECTIONS = { "forward", "back", "left", "right", "up", "down" }
+local OPPOSITE_DIRECTION = {
+    forward = "back",
+    back = "forward",
+    left = "right",
+    right = "left",
+    up = "down",
+    down = "up",
+}
+
+local function refuelFromSpawn(state, cfg, targetLevel)
+    local function currentFuel()
+        local level = turtle.getFuelLevel()
+        if level == "unlimited" then
+            return math.huge
+        end
+        return level
+    end
+    if currentFuel() >= targetLevel then
+        return true
+    end
+    if not Navigator.returnToSpawn(state, cfg) then
+        return false, "navigation_failed"
+    end
+    if not Navigator.faceInventories(state, cfg) then
+        return false, "inventory_orientation_failed"
+    end
+    local attempts = 0
+    repeat
+        attempts = attempts + 1
+        local sucked, err = turtle.suck(64) -- DOCS.turtle suck pulls items from inventory in front
+        if not sucked and err and err ~= "No items to take" then
+            Log.write("warn", "Fuel chest interaction failed", { err = tostring(err) })
+            break
+        end
+        for slot = 1, 16 do
+            turtle.select(slot)
+            if turtle.getItemCount(slot) > 0 then
+                local probe = turtle.refuel(0)
+                if probe then
+                    local consumed = turtle.refuel()
+                    if not consumed then
+                        turtle.drop() -- Drop non-fuel items back into the inventory (DOCS.turtle drop)
+                    end
+                else
+                    turtle.drop()
+                end
+            end
+        end
+        sleep(0.1)
+    until currentFuel() >= targetLevel or attempts >= 6
+    turtle.select(1)
+    local finalLevel = currentFuel()
+    if finalLevel >= targetLevel then
+        Log.write("info", "Refuelled from spawn inventory", { level = finalLevel })
+        return true
+    end
+    return false, "insufficient_fuel"
+end
+
+local function ensureFuelForJob(state, cfg, minimum)
+    minimum = minimum or cfg.fuel.reserve
+    local level = turtle.getFuelLevel()
+    if level == "unlimited" or level >= minimum then
+        return true
+    end
+    local ok = ensureFuelReserve(cfg)
+    if ok and turtle.getFuelLevel() >= minimum then
+        return true
+    end
+    local success = refuelFromSpawn(state, cfg, minimum)
+    return success
+end
+
+local function carveTunnelStep(ctx)
+    Movement.clearRelative(ctx.state, "up")
+    if not Movement.forward(ctx.state, ctx.cfg) then
+        return false, "forward_blocked"
+    end
+    Movement.clearRelative(ctx.state, "up")
+    scanForSideOres(ctx)
+    return true
+end
+
+local function runTunnelJob(ctx)
+    local details = ctx.job.details or {}
+    local start = details.start or ctx.state.position
+    local target = {
+        x = start.x,
+        y = details.layerY or start.y or ctx.state.position.y,
+        z = start.z,
+    }
+    if not Navigator.moveTo(ctx.state, ctx.cfg, target) then
+        return false, "navigation_failed"
+    end
+    local direction = details.direction or ctx.cfg.boundingBox.originForward or { x = 0, z = 1 }
+    local faced = select(1, Movement.faceVector(ctx.state, direction))
+    if not faced then
+        return false, "direction_invalid"
+    end
+    local length = details.length or ctx.cfg.layers.spacing or 2
+    for step = 1, length do
+        if not ensureFuelForJob(ctx.state, ctx.cfg, ctx.cfg.fuel.reserve * 2) then
+            return false, "fuel_depleted"
+        end
+        local ok, reason = carveTunnelStep(ctx)
+        if not ok then
+            return false, reason
+        end
+    end
+    return true, length
+end
+
+local function floodFillOre(ctx)
+    local details = ctx.job.details or {}
+    local approach = details.approach or ctx.state.position
+    if not Navigator.moveTo(ctx.state, ctx.cfg, approach) then
+        return false, "navigation_failed"
+    end
+    if details.approachFacing then
+        if not Movement.face(ctx.state, details.approachFacing) then
+            return false, "approach_facing_failed"
+        end
+    end
+    local targetBlock = details.block
+    if not targetBlock then
+        return false, "missing_target_block"
+    end
+    if not ensureFuelForJob(ctx.state, ctx.cfg, ctx.cfg.fuel.reserve * 3) then
+        return false, "fuel_depleted"
+    end
+    local maxNodes = details.maxNodes or (ctx.cfg.job and ctx.cfg.job.maxOreNodes) or 96
+    local mined = 0
+    local visited = {}
+
+    local function explore(direction)
+        if mined >= maxNodes then
+            return
+        end
+        local targetPos = Movement.project(ctx.state, direction)
+        if not withinBoundingBox(targetPos, ctx.cfg) then
+            return
+        end
+        local key = oreKey(targetPos, targetBlock)
+        if visited[key] then
+            return
+        end
+        local ok, data = Movement.inspect(ctx.state, direction)
+        if not ok or not data or data.name ~= targetBlock then
+            return
+        end
+        if not Movement.clearRelative(ctx.state, direction) then
+            return
+        end
+        if not Movement.step(ctx.state, ctx.cfg, direction) then
+            return
+        end
+        visited[key] = true
+        mined = mined + 1
+        for _, nextDir in ipairs(FLOOD_DIRECTIONS) do
+            explore(nextDir)
+        end
+        local backDir = OPPOSITE_DIRECTION[direction]
+        if backDir then
+            if not Movement.step(ctx.state, ctx.cfg, backDir) then
+                Log.write("warn", "Failed to retreat during ore flood", { dir = direction })
+            end
+        end
+    end
+
+    explore(details.entryDirection or "forward")
+    if details.oreKey and ctx.state.oreBookmarks then
+        ctx.state.oreBookmarks[details.oreKey] = nil
+    end
+    return mined > 0, mined
+end
+
+local function registerJobExecutors()
+    Scheduler.register("diagnostic", function(ctx)
+        Log.write("info", "Diagnostic job executed", { requester = ctx.job.details and ctx.job.details.requestedBy })
+        return { success = true, notes = "diagnostic_complete" }
+    end)
+
+    Scheduler.register("fuel", function(ctx)
+        local details = ctx.job.details or {}
+        local target = details.targetLevel or (ctx.cfg.fuel.reserve * 2)
+        if turtle.getFuelLevel() >= target then
+            return { success = true, fuel = turtle.getFuelLevel(), notes = "already_full" }
+        end
+        local ok, reason = refuelFromSpawn(ctx.state, ctx.cfg, target)
+        if not ok then
+            return { success = false, error = reason or "refuel_failed", fuel = turtle.getFuelLevel() }
+        end
+        return { success = true, fuel = turtle.getFuelLevel() }
+    end)
+
+    Scheduler.register("tunnel", function(ctx)
+        local ok, result = runTunnelJob(ctx)
+        if not ok then
+            return { success = false, error = result }
+        end
+        return { success = true, length = result }
+    end)
+
+    Scheduler.register("ore", function(ctx)
+        local ok, mined = floodFillOre(ctx)
+        if not ok then
+            return { success = false, error = mined }
+        end
+        return { success = true, mined = mined }
+    end)
+end
+
+registerJobExecutors()
 
 local function cliMenu()
     print("\n=== AutoMine Menu ===")
@@ -696,22 +1424,24 @@ local function enqueueTestJob(quarryId)
     Jobs.enqueue(quarryId, job)
 end
 
-local function schedulerTick(quarryId, state)
+local function schedulerTick(quarryId, state, cfg)
     local queue = Jobs.loadQueue(quarryId)
     local nextJob = Scheduler.nextJob(queue, state)
     if not nextJob then
         Log.write("debug", "No jobs available")
         return
     end
-    Scheduler.claimJob(nextJob, state)
-    Log.write("info", "Claimed job", { id = nextJob.id })
-    -- Placeholder job executor
-    sleep(1)
-    Scheduler.completeJob(nextJob, {
-        success = true,
-        quarryId = quarryId,
-        notes = "Placeholder completion",
-    })
+    Scheduler.claimJob(quarryId, nextJob, state)
+    Log.write("info", "Claimed job", { id = nextJob.id, type = nextJob.job.type })
+    TurtleState.save(state)
+    local success, outcome = Scheduler.execute(quarryId, nextJob, state, cfg)
+    if success then
+        outcome.quarryId = quarryId
+        Scheduler.completeJob(quarryId, nextJob, outcome)
+    else
+        Scheduler.failJob(quarryId, nextJob, outcome.error or "unknown", cfg)
+    end
+    TurtleState.save(state)
 end
 
 local function main()
@@ -733,7 +1463,7 @@ local function main()
     ensureFuelReserve(cfg)
 
     while true do
-        schedulerTick(qId, state)
+        schedulerTick(qId, state, cfg)
         local choice = cliMenu()
         if choice == 1 then
             printStatus(state, cfg)

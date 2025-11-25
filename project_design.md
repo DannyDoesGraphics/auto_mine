@@ -142,3 +142,7 @@ XXXXXXXXSI...I
 - Logging is verbose by default (console + optional file). Use menu option `2` at runtime to toggle file logging without editing code; console verbosity is read from config.
 - Menu option `3` issues a network-wide recall using `rednet.broadcast` scoped to the quarry protocol, while option `4` enqueues a diagnostic job to exercise the ACID-style job log.
 - Scheduler tick currently replays the queue, deterministically claims the highest-priority job, journals the claim, and publishes completion packets so multi-turtle deployments can reconcile state when they come back online.
+- Jobs now execute through typed handlers (`diagnostic`, `fuel`, `tunnel`, `ore`). Claim records are journaled before execution, success/failure is appended afterward, and retries obey the configurable `job.retryLimit`.
+- Fueling jobs route turtles to the spawn column, face the shared inventory stack, `suck` fuel, and refuel slots in place; they respect a configurable target level and fall back to the previous in-inventory `refuel` probe before travelling.
+- Tunneling jobs honor the 2×1 profile: each step clears headroom, advances one block inside the bounding box, and scans left/right/up/down to queue ore jobs keyed by position to avoid duplicates.
+- Ore jobs execute a bounded flood-fill (default `job.maxOreNodes`) that recursively digs connected ore blocks while never stepping beyond the quarry bounding box; discovery metadata lets turtles forget mined veins so they can be re-queued later if needed.
