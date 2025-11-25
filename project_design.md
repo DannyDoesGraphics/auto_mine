@@ -15,7 +15,7 @@
  - Defines a group of turtles that are expected to cooperatively work together
  - **Cooperative multi-tasking algorithms are critical here**
  - All turtle as such have a "quarry id" they're associated with and only listen to with other turtles in the same quarry
-- Each quarry has a configured **bounding box** size which is the second point defined relative the turtle space where [origin, second_point] defines the box
+- Each quarry has a configured **bounding box** size which is the second point defined relative the turtle space where [origin + origin_forward_1, second_point] defines the box
  - Under no circumstances, may turtles ever enter, manipulate, or even interact blocks outside of the bounding box
 
 ## Configurations
@@ -90,7 +90,7 @@ I = inventories
 XOOOOOOO
 XXXXXXXX
 XOOOOOOO
-XOOOOOOO
+XOOOOOOX
 XXXXXXXX
 XOOOOOOO
 S
@@ -98,14 +98,19 @@ I...I
 
 #### Side-view (vertical)
 
-OOOOOOOOSI...I
+XOOOOOOOSI...I
 XXXXXXXXSI...I
-OOOOOOOOSI...I
-OOOOOOOOSI...I
+XOOOOOOOSI...I
+XOOOOOOOSI...I
 XXXXXXXXSI...I
 
+
+- Notice how forward + 1 protects our inventory spaces!!
+- We have dug a secondary tunnel "main" tunnel for both vertical and horizontal, this gives us the ability to traverse both!
+- Also, despite the prior warnings, the only exception to the no outside of bounding-box rule is on the spawn column where you're allowed to dig up and down
+
 ### Ore mining
-- Use a flood fill algorithm
+- Use a flood fill algorithm (ideally BFS)
 - Ideally, we can leverage a multi-turtle flood fill algorithm
  - However, given the prior requirements of tunnel mutexes, I am concerned how we would exactly carry this out whilst ensuring we don't also accidentially destroy other turtles
 
@@ -126,4 +131,14 @@ XXXXXXXXSI...I
 # Watch out for
 - How persistence + multi-turtle tasking works together! Ensure that turtles when loaded in can seamlessly mesh back together
 - Also, turtles may not load together all at once! This is a serious edge case to consider!
-- Upon startup, turtles should try to refuel!
+- Upon startup at spawn, turtles should try to refuel!
+- Project needs to be kept into a single `main.lua`!
+- VALIDATE ALL MINING OPERATIONS AND ENSURE YOU NEVER DIG ANOTHER TURTLE!! 
+
+## Implementation Notes (2025-11-24 build)
+- `main.lua` now bootstraps the full runtime: configuration lives under `/state/configs/<quarryId>.json`, turtle state under `/state/turtles/`, jobs under `/state/jobs/`, and verbose logs under `/logs/<quarryId>.log` when enabled.
+- The startup wizard guides the quarry config authoring directly on the turtle (text-menu CLI), matching the requirement for interactive installs. Bounding boxes, spawn column data, layer spacing, logging verbosity, and fuel reserves are all captured there.
+- Every call into `turtle`, `rednet`, `textutils`, `fs`, and `peripheral` is cross-checked against the CC: Tweaked offline docs mirrored in `cc_docs/tweaked.cc/module/*.html`; the code references those docs in comments and validates API availability before executing.
+- Logging is verbose by default (console + optional file). Use menu option `2` at runtime to toggle file logging without editing code; console verbosity is read from config.
+- Menu option `3` issues a network-wide recall using `rednet.broadcast` scoped to the quarry protocol, while option `4` enqueues a diagnostic job to exercise the ACID-style job log.
+- Scheduler tick currently replays the queue, deterministically claims the highest-priority job, journals the claim, and publishes completion packets so multi-turtle deployments can reconcile state when they come back online.
