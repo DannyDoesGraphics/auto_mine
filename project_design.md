@@ -80,6 +80,30 @@
 - A main up "branch" is created to allow traversal between all layers
 - On this main branch, turtles branch off respectively and create strip mines
 
+#### Top-down view per layer
+S = spawn column
+O = filled
+X = to-be-mined/should be mined/mined out
+I = inventories
+
+
+XOOOOOOO
+XXXXXXXX
+XOOOOOOO
+XOOOOOOO
+XXXXXXXX
+XOOOOOOO
+S
+I...I
+
+#### Side-view (vertical)
+
+OOOOOOOOSI...I
+XXXXXXXXSI...I
+OOOOOOOOSI...I
+OOOOOOOOSI...I
+XXXXXXXXSI...I
+
 ### Ore mining
 - Use a flood fill algorithm
 - Ideally, we can leverage a multi-turtle flood fill algorithm
