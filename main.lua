@@ -1028,6 +1028,7 @@ local function messageLoop(network, leader, worker, logger)
 		end
 		local status = worker:tick()
 		leader:tick(status)
+		leader:updateMaster()
 		sleepFn(0)
 	end
 end
